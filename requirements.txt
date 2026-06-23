@@ -1,0 +1,26 @@
+# Excel Query Scheduler - dependencies
+# Python 3.10+ (built on 3.13)
+# Install:  pip install -r requirements.txt
+#
+# NOTE: pywin32 works only on Windows (Excel COM automation).
+
+# --- GUI ---
+PyQt6>=6.7.0
+PyQt6-WebEngine>=6.7.0          # embedded browser for the ad banner (Stage 5)
+
+# --- Excel via COM (Windows only) ---
+pywin32>=306
+
+# --- Task scheduler ---
+APScheduler>=3.10.4
+
+# --- System tray ---
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# --- Build to .exe (needed only for release, Stage 7) ---
+pyinstaller>=6.0.0
+
+# Storage (SQLite, json) are standard library modules - no install needed.
+# Analytics server (FastAPI, Stage 6) is a SEPARATE component and will get
+# its own server/requirements.txt later.
