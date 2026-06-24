@@ -44,6 +44,13 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BANNER_HEIGHT = 90                                   # px, по ТЗ
 BANNER_REFRESH_SEC = 45                              # период обновления (30–60 сек по ТЗ)
 
+# --- Аналитика и проверка обновлений (Этап 6) ---
+# Базовый URL сервера аналитики (FastAPI на Render). Без завершающего слэша.
+# В разработке можно временно указать "http://127.0.0.1:8000".
+ANALYTICS_URL = "https://example.onrender.com"
+ANALYTICS_TIMEOUT_SEC = 5                            # таймаут сетевых запросов, сек
+INSTALL_ID_PATH = DATA_DIR / "install_id"            # анонимный UUID установки (один раз)
+
 # --- Настройки по умолчанию ---
 DEFAULTS = {
     "start_with_windows": True,    # автозапуск с системой
