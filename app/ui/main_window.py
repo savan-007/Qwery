@@ -1,20 +1,25 @@
 """
 app/ui/main_window.py
 
-Главное окно приложения (Этапы 3–4).
+Главное окно приложения (Этапы 3–4, интеграция аналитики — Этап 6).
 
 Этап 3:
     список файлов с расписанием (№1, №2), статус (№8), журнал (№5).
 Этап 4:
     системный трей (№4), уведомления Windows (№6), автозапуск, настройки.
+Этап 6:
+    запуск анонимной аналитики и проверки обновлений (AnalyticsClient).
+    Результат («доступна новая версия») приходит из фонового потока в UI
+    через тот же SignalBridge, что и завершение обновлений.
 
 Трей реализован на QSystemTrayIcon (встроен в PyQt6) — в общем event-loop Qt,
 без отдельного потока pystray. Закрытие окна по настройке сворачивает программу
 в трей; реальный выход — пункт «Выход» в меню трея.
 
 Потоки:
-    планировщик зовёт on_run_complete из фонового потока, поэтому результат
-    идёт в интерфейс через сигнал Qt (SignalBridge) — слот в главном потоке.
+    планировщик и аналитика зовут колбэки из фоновых потоков, поэтому
+    результат идёт в интерфейс через сигналы Qt (SignalBridge) — слоты в
+    главном потоке.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from PyQt6.QtWidgets import (
 
 import config
 from app.core import autostart
+from app.core.analytics import AnalyticsClient
 from app.core.scheduler import RefreshScheduler
 from app.core.settings import Settings
 from app.core.storage import RunRecord, Storage
@@ -66,9 +72,10 @@ _ID_ROLE = Qt.ItemDataRole.UserRole
 
 
 class SignalBridge(QObject):
-    """Колбэк планировщика → сигнал Qt (потокобезопасно)."""
+    """Колбэки фоновых потоков → сигналы Qt (потокобезопасно)."""
 
-    run_completed = pyqtSignal(object)  # RunRecord
+    run_completed = pyqtSignal(object)   # RunRecord (планировщик)
+    update_available = pyqtSignal(str)   # latest_version (аналитика, Этап 6)
 
 
 def _fmt_dt(dt: datetime) -> str:
@@ -110,6 +117,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._shut_done = False
         self._tray_hint_shown = False
+        self._update_hint_shown = False
         self._row_by_id: dict[int, int] = {}
 
         self._app_icon = _make_app_icon()
@@ -117,9 +125,17 @@ class MainWindow(QMainWindow):
 
         self._bridge = SignalBridge()
         self._bridge.run_completed.connect(self._on_run_completed)
+        self._bridge.update_available.connect(self._on_update_available)
         self._scheduler = RefreshScheduler(
             storage,
             on_run_complete=self._bridge.run_completed.emit,
+        )
+
+        # Клиент аналитики и проверки обновлений (Этап 6).
+        # Запуск откладываем до конца __init__ — после построения трея.
+        self._analytics = AnalyticsClient(
+            self._settings,
+            on_update_available=self._bridge.update_available.emit,
         )
 
         self.setWindowTitle(f"{config.APP_NAME} v{config.APP_VERSION}")
@@ -143,6 +159,12 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+
+        # Анонимный ping + проверка обновлений в фоне (только если включено).
+        try:
+            self._analytics.start()
+        except Exception:
+            logger.exception("Не удалось запустить аналитику")
 
     # ----------------------------------------------------------------- #
     # Построение интерфейса
@@ -553,7 +575,7 @@ class MainWindow(QMainWindow):
             )
 
     # ----------------------------------------------------------------- #
-    # Сигнал из планировщика (главный поток)
+    # Сигналы из фоновых потоков (главный поток)
     # ----------------------------------------------------------------- #
     def _on_run_completed(self, record: RunRecord) -> None:
         self.journal_table.insertRow(0)
@@ -563,6 +585,25 @@ class MainWindow(QMainWindow):
         self.update_files_dynamic()
         self.update_status_strip()
         self._notify(record)
+
+    def _on_update_available(self, latest: str) -> None:
+        """Ненавязчиво сообщить о новой версии (Этап 6). Без модальных окон."""
+        msg = f"Доступна новая версия {latest} (у вас {config.APP_VERSION})"
+        self.statusBar().showMessage(msg, 10000)
+        if self._update_hint_shown:
+            return  # уведомление в трее показываем один раз за сессию
+        self._update_hint_shown = True
+        if (
+            hasattr(self, "_tray")
+            and self._tray.isVisible()
+            and QSystemTrayIcon.supportsMessages()
+        ):
+            self._tray.showMessage(
+                "Доступно обновление",
+                msg,
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
 
     # ----------------------------------------------------------------- #
     # Завершение / трей
