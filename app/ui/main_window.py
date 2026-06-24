@@ -1,21 +1,20 @@
 """
 app/ui/main_window.py
 
-Главное окно приложения (Этап 3).
+Главное окно приложения (Этапы 3–4).
 
-Собирает воедино слой Этапа 2:
-    * список файлов с расписанием  — функции ТЗ №1, №2;
-    * статус в реальном времени     — функция №8 (полоса сверху + QTimer);
-    * журнал обновлений             — функция №5 (таблица снизу).
+Этап 3:
+    список файлов с расписанием (№1, №2), статус (№8), журнал (№5).
+Этап 4:
+    системный трей (№4), уведомления Windows (№6), автозапуск, настройки.
+
+Трей реализован на QSystemTrayIcon (встроен в PyQt6) — в общем event-loop Qt,
+без отдельного потока pystray. Закрытие окна по настройке сворачивает программу
+в трей; реальный выход — пункт «Выход» в меню трея.
 
 Потоки:
-    планировщик вызывает on_run_complete из фонового потока, поэтому результат
-    прокидывается в интерфейс через сигнал Qt (SignalBridge) — слот выполняется
-    уже в главном потоке. Раз в секунду QTimer обновляет «живой» статус.
-
-Что появится позже:
-    сворачивание в трей и автозапуск — Этап 4; рекламный баннер — Этап 5.
-    Сейчас закрытие окна штатно останавливает планировщик и закрывает базу.
+    планировщик зовёт on_run_complete из фонового потока, поэтому результат
+    идёт в интерфейс через сигнал Qt (SignalBridge) — слот в главном потоке.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import sys
 from datetime import datetime
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,10 +33,12 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
     QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -45,39 +46,30 @@ from PyQt6.QtWidgets import (
 )
 
 import config
+from app.core import autostart
 from app.core.scheduler import RefreshScheduler
+from app.core.settings import Settings
 from app.core.storage import RunRecord, Storage
 from app.ui.schedule_dialog import ScheduleDialog
+from app.ui.settings_dialog import SettingsDialog
 
 logger = logging.getLogger(__name__)
 
-# Цвета результата
 _OK_COLOR = QColor("#1a7f37")
 _ERR_COLOR = QColor("#cf222e")
-
-# Фильтр выбора файлов
 _FILE_FILTER = "Книги Excel (*.xlsx *.xlsm *.xlsb);;Все файлы (*)"
 
-# Колонки таблицы файлов
 _C_NAME, _C_SCHED, _C_STATE, _C_LAST, _C_NEXT = range(5)
-# Колонки журнала
 _J_TIME, _J_FILE, _J_DUR, _J_RESULT = range(4)
-
 _ID_ROLE = Qt.ItemDataRole.UserRole
 
 
-# --------------------------------------------------------------------------- #
-# Мост «фоновый поток → главный поток»
-# --------------------------------------------------------------------------- #
 class SignalBridge(QObject):
-    """Превращает колбэк планировщика в сигнал Qt (потокобезопасно)."""
+    """Колбэк планировщика → сигнал Qt (потокобезопасно)."""
 
     run_completed = pyqtSignal(object)  # RunRecord
 
 
-# --------------------------------------------------------------------------- #
-# Форматирование
-# --------------------------------------------------------------------------- #
 def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%d.%m %H:%M:%S")
 
@@ -90,13 +82,38 @@ def _fmt_dur(sec: float) -> str:
     return f"{sec:.0f} c"
 
 
-# --------------------------------------------------------------------------- #
+def _make_app_icon() -> QIcon:
+    """Программная иконка (до появления .ico-ресурса на Этапе 7)."""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#2d6cdf"))
+    p.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    p.setPen(QColor("white"))
+    font = QFont()
+    font.setBold(True)
+    font.setPointSize(30)
+    p.setFont(font)
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "Q")
+    p.end()
+    return QIcon(pm)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self._storage = storage
+        self._settings = Settings()
+        self._quitting = False
+        self._shut_done = False
+        self._tray_hint_shown = False
+        self._row_by_id: dict[int, int] = {}
 
-        # мост сигналов + планировщик
+        self._app_icon = _make_app_icon()
+        self.setWindowIcon(self._app_icon)
+
         self._bridge = SignalBridge()
         self._bridge.run_completed.connect(self._on_run_completed)
         self._scheduler = RefreshScheduler(
@@ -104,19 +121,23 @@ class MainWindow(QMainWindow):
             on_run_complete=self._bridge.run_completed.emit,
         )
 
-        self._row_by_id: dict[int, int] = {}
-
         self.setWindowTitle(f"{config.APP_NAME} v{config.APP_VERSION}")
         self.resize(900, 600)
+        self._build_menu()
         self._build_ui()
+        self._build_tray()
 
-        # данные + запуск планировщика
+        # синхронизируем автозапуск с настройкой при старте
+        try:
+            autostart.apply(bool(self._settings.get("start_with_windows")))
+        except Exception:
+            logger.exception("Не удалось применить автозапуск при старте")
+
         self.rebuild_files_table()
         self.reload_journal()
         self._scheduler.start()
         self.update_status_strip()
 
-        # таймер «живого» статуса
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
@@ -125,8 +146,15 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- #
     # Построение интерфейса
     # ----------------------------------------------------------------- #
-    def _icon(self, pixmap: QStyle.StandardPixmap):
+    def _icon(self, pixmap: QStyle.StandardPixmap) -> QIcon:
         return self.style().standardIcon(pixmap)
+
+    def _build_menu(self) -> None:
+        menu = self.menuBar().addMenu("Программа")
+        menu.addAction("Настройки…", self.on_settings)
+        menu.addSeparator()
+        menu.addAction("Свернуть в трей", self.hide)
+        menu.addAction("Выход", self._quit)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -134,13 +162,11 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(10, 10, 10, 8)
         root.setSpacing(8)
 
-        # --- Полоса статуса (функция №8) ---
         self.status_strip = QLabel()
         self.status_strip.setObjectName("statusStrip")
         self.status_strip.setTextFormat(Qt.TextFormat.RichText)
         root.addWidget(self.status_strip)
 
-        # --- Панель кнопок ---
         bar = QHBoxLayout()
         self.btn_add = QPushButton(" Добавить файл")
         self.btn_add.setIcon(self._icon(QStyle.StandardPixmap.SP_FileIcon))
@@ -164,7 +190,6 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         root.addLayout(bar)
 
-        # --- Разделитель: файлы сверху, журнал снизу ---
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         self.files_table = self._make_table(
@@ -194,6 +219,25 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStyleSheet(_STYLE)
         self._update_buttons()
+
+    def _build_tray(self) -> None:
+        self._tray = QSystemTrayIcon(self._app_icon, self)
+        self._tray.setToolTip(config.APP_NAME)
+
+        menu = QMenu()
+        menu.addAction("Открыть", self._restore)
+        menu.addAction("Обновить все сейчас", self.on_run_all)
+        menu.addSeparator()
+        menu.addAction("Настройки…", self.on_settings)
+        menu.addSeparator()
+        menu.addAction("Выход", self._quit)
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray.show()
+        else:
+            logger.warning("Системный трей недоступен — закрытие будет завершать программу")
 
     def _make_table(self, headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
@@ -240,7 +284,6 @@ class MainWindow(QMainWindow):
         for row, st in enumerate(statuses):
             fid = st.file.id
             self._row_by_id[fid] = row
-
             name_item = QTableWidgetItem(st.file.path.name)
             name_item.setData(_ID_ROLE, fid)
             name_item.setToolTip(str(st.file.path))
@@ -250,8 +293,6 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def _fill_dynamic(self, row: int, st) -> None:
-        """Состояние / последнее / следующее — то, что меняется со временем."""
-        # Состояние
         if st.running:
             state_text = "обновляется…"
         elif st.file.enabled:
@@ -263,7 +304,6 @@ class MainWindow(QMainWindow):
             state_item.setForeground(QBrush(QColor("#8a8a8a")))
         self.files_table.setItem(row, _C_STATE, state_item)
 
-        # Последнее обновление
         last = st.last_run
         if last is None:
             last_item = QTableWidgetItem("—")
@@ -275,7 +315,6 @@ class MainWindow(QMainWindow):
                 last_item.setToolTip(last.error)
         self.files_table.setItem(row, _C_LAST, last_item)
 
-        # Следующее
         nxt = st.next_run
         self.files_table.setItem(
             row, _C_NEXT, QTableWidgetItem(_fmt_next(nxt) if nxt else "—")
@@ -283,8 +322,7 @@ class MainWindow(QMainWindow):
 
     def update_files_dynamic(self) -> None:
         statuses = self._scheduler.get_status()
-        ids_now = {st.file.id for st in statuses}
-        if ids_now != set(self._row_by_id.keys()):
+        if {st.file.id for st in statuses} != set(self._row_by_id.keys()):
             self.rebuild_files_table()
             return
         for st in statuses:
@@ -325,14 +363,13 @@ class MainWindow(QMainWindow):
         self.journal_table.setItem(row, _J_RESULT, item)
 
     # ----------------------------------------------------------------- #
-    # Статус (функция №8)
+    # Статус (функция №8) + подсказка трея
     # ----------------------------------------------------------------- #
     def update_status_strip(self) -> None:
         statuses = self._scheduler.get_status()
         active = sum(1 for s in statuses if s.file.enabled)
         total = len(statuses)
 
-        # последнее обновление по всем файлам
         last_runs = [s.last_run for s in statuses if s.last_run]
         if last_runs:
             last = max(last_runs, key=lambda r: r.finished_at)
@@ -341,7 +378,6 @@ class MainWindow(QMainWindow):
         else:
             last_txt = "—"
 
-        # ближайший запуск среди включённых
         next_candidates = [(s.next_run, s.file.path.name) for s in statuses if s.next_run]
         if next_candidates:
             nxt, name = min(next_candidates, key=lambda t: t[0])
@@ -354,9 +390,10 @@ class MainWindow(QMainWindow):
             f"<b>Последнее:</b> {last_txt} &nbsp;•&nbsp; "
             f"<b>Ближайшее:</b> {next_txt}"
         )
+        if hasattr(self, "_tray"):
+            self._tray.setToolTip(f"{config.APP_NAME} — активно {active} из {total}")
 
     def _tick(self) -> None:
-        """Раз в секунду: обновляем динамику и полосу статуса."""
         self.update_files_dynamic()
         self.update_status_strip()
 
@@ -364,9 +401,7 @@ class MainWindow(QMainWindow):
     # Действия пользователя
     # ----------------------------------------------------------------- #
     def on_add_file(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Выберите файлы Excel", "", _FILE_FILTER
-        )
+        paths, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы Excel", "", _FILE_FILTER)
         if not paths:
             return
         dialog = ScheduleDialog(self)
@@ -375,22 +410,20 @@ class MainWindow(QMainWindow):
         schedule = dialog.get_schedule()
         if schedule is None:
             return
-
-        added, skipped = 0, []
+        added, skipped = 0, 0
         for path in paths:
             try:
                 wf = self._storage.add_file(path, schedule)
                 self._scheduler.sync_file(wf.id)
                 added += 1
             except ValueError:
-                skipped.append(path)
-
+                skipped += 1
         self.rebuild_files_table()
         self.update_status_strip()
         if skipped:
             QMessageBox.information(
                 self, "Добавление файлов",
-                f"Добавлено: {added}. Уже в списке (пропущено): {len(skipped)}.",
+                f"Добавлено: {added}. Уже в списке (пропущено): {skipped}.",
             )
 
     def on_edit_schedule(self) -> None:
@@ -431,6 +464,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Обновление запущено…", 3000)
         self.update_files_dynamic()
 
+    def on_run_all(self) -> None:
+        started = 0
+        for st in self._scheduler.get_status():
+            if st.file.enabled and st.file.id is not None:
+                self._scheduler.run_now(st.file.id)
+                started += 1
+        self.statusBar().showMessage(f"Запущено обновлений: {started}", 3000)
+
     def on_remove_file(self) -> None:
         fid = self._selected_file_id()
         if fid is None:
@@ -457,33 +498,110 @@ class MainWindow(QMainWindow):
         self._storage.clear_log()
         self.reload_journal()
 
+    def on_settings(self) -> None:
+        dialog = SettingsDialog(self, self._settings)
+        if dialog.exec() != int(SettingsDialog.DialogCode.Accepted):
+            return
+        values = dialog.get_values()
+        self._settings.update(values)
+        try:
+            autostart.apply(values["start_with_windows"])
+        except Exception:
+            logger.exception("Не удалось применить автозапуск")
+
+    # ----------------------------------------------------------------- #
+    # Трей
+    # ----------------------------------------------------------------- #
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:  # одиночный клик
+            if self.isVisible():
+                self.hide()
+            else:
+                self._restore()
+
+    def _restore(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _notify(self, record: RunRecord) -> None:
+        if not self._settings.get("show_notifications"):
+            return
+        if not (hasattr(self, "_tray") and self._tray.isVisible()):
+            return
+        if not QSystemTrayIcon.supportsMessages():
+            return
+        name = record.file_path.name
+        if record.success:
+            self._tray.showMessage(
+                "Обновление выполнено",
+                f"{name} — успешно ({record.duration_sec:.0f} c)",
+                QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
+        else:
+            self._tray.showMessage(
+                "Ошибка обновления",
+                f"{name}: {record.error or 'ошибка'}",
+                QSystemTrayIcon.MessageIcon.Critical,
+                6000,
+            )
+
     # ----------------------------------------------------------------- #
     # Сигнал из планировщика (главный поток)
     # ----------------------------------------------------------------- #
     def _on_run_completed(self, record: RunRecord) -> None:
-        # добавляем строку в начало журнала
         self.journal_table.insertRow(0)
         self._set_journal_row(0, record)
-        # ограничиваем журнал на экране
         while self.journal_table.rowCount() > 200:
             self.journal_table.removeRow(self.journal_table.rowCount() - 1)
-
         self.update_files_dynamic()
         self.update_status_strip()
-
-        mark = "успешно" if record.success else f"ошибка: {record.error}"
-        self.statusBar().showMessage(f"{record.file_path.name} — {mark}", 5000)
+        self._notify(record)
 
     # ----------------------------------------------------------------- #
-    def closeEvent(self, event) -> None:
-        # Этап 4 заменит это сворачиванием в трей.
-        self._timer.stop()
+    # Завершение / трей
+    # ----------------------------------------------------------------- #
+    def _shutdown(self) -> None:
+        if self._shut_done:
+            return
+        self._shut_done = True
+        if hasattr(self, "_timer"):
+            self._timer.stop()
         self._scheduler.shutdown(wait=False)
         self._storage.close()
+
+    def _quit(self) -> None:
+        self._quitting = True
+        self._shutdown()
+        if hasattr(self, "_tray"):
+            self._tray.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event) -> None:
+        # Сворачивание в трей вместо закрытия (функция №4)
+        to_tray = (
+            not self._quitting
+            and bool(self._settings.get("minimize_to_tray"))
+            and hasattr(self, "_tray")
+            and self._tray.isVisible()
+        )
+        if to_tray:
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown and QSystemTrayIcon.supportsMessages():
+                self._tray.showMessage(
+                    config.APP_NAME,
+                    "Программа свёрнута в трей и продолжает работать.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+                self._tray_hint_shown = True
+            return
+        self._shutdown()
         super().closeEvent(event)
 
 
-# Лёгкая стилизация QSS
 _STYLE = """
 #statusStrip {
     background: #eef3fb;
@@ -497,12 +615,8 @@ _STYLE = """
     color: #44505c;
     margin-top: 2px;
 }
-QPushButton {
-    padding: 6px 12px;
-}
-QTableWidget {
-    gridline-color: #e3e7ed;
-}
+QPushButton { padding: 6px 12px; }
+QTableWidget { gridline-color: #e3e7ed; }
 QHeaderView::section {
     background: #f4f6f9;
     padding: 5px;
@@ -513,9 +627,7 @@ QHeaderView::section {
 """
 
 
-# --------------------------------------------------------------------------- #
 def run() -> int:
-    """Запустить приложение целиком."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -527,6 +639,9 @@ def run() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(config.APP_NAME)
     app.setOrganizationName(config.ORG_NAME)
+    # Закрытие окна не должно завершать приложение — мы управляем выходом сами
+    # (окно может быть скрыто в трее).
+    app.setQuitOnLastWindowClosed(False)
 
     storage = Storage()
     window = MainWindow(storage)
