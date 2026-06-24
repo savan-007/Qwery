@@ -50,6 +50,7 @@ from app.core import autostart
 from app.core.scheduler import RefreshScheduler
 from app.core.settings import Settings
 from app.core.storage import RunRecord, Storage
+from app.ui.banner import WEBENGINE_AVAILABLE, BannerWidget
 from app.ui.schedule_dialog import ScheduleDialog
 from app.ui.settings_dialog import SettingsDialog
 
@@ -215,6 +216,10 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         root.addWidget(splitter, 1)
+
+        # Рекламный баннер снизу (функция №7): фиксированная высота, во всю ширину
+        self.banner = BannerWidget(self)
+        root.addWidget(self.banner)
 
         self.setCentralWidget(central)
         self.setStyleSheet(_STYLE)
@@ -568,6 +573,8 @@ class MainWindow(QMainWindow):
         self._shut_done = True
         if hasattr(self, "_timer"):
             self._timer.stop()
+        if hasattr(self, "banner"):
+            self.banner.stop()
         self._scheduler.shutdown(wait=False)
         self._storage.close()
 
@@ -636,6 +643,9 @@ def run() -> int:
             logging.FileHandler(config.LOG_PATH, encoding="utf-8"),
         ],
     )
+    # WebEngine рекомендует общий контекст OpenGL — выставить до QApplication.
+    if WEBENGINE_AVAILABLE:
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(config.APP_NAME)
     app.setOrganizationName(config.ORG_NAME)
