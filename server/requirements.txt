@@ -1,0 +1,9 @@
+# Excel Query Scheduler — Analytics server (Stage 6)
+# Separate component from the desktop client.
+# Install:  pip install -r requirements.txt
+# Run:      uvicorn main:app --host 0.0.0.0 --port $PORT
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# pydantic ships with fastapi; SQLite is in the standard library.
