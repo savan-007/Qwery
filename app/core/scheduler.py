@@ -41,6 +41,17 @@ from app.core.storage import RunRecord, Schedule, Storage, WatchedFile
 logger = logging.getLogger(__name__)
 
 
+def _local_timezone():
+    """Фактическая локальная зона ОС с текущим смещением.
+
+    Берём смещение из самой ОС, а не из авто-определения tzlocal: при
+    расхождении настроек системы tzlocal может вернуть зону с другим
+    смещением (предупреждение «offset does not match»), из-за чего
+    расписания «в ЧЧ:ММ» сработали бы со сдвигом на час.
+    """
+    return datetime.now().astimezone().tzinfo
+
+
 @dataclass(slots=True)
 class FileStatus:
     """Снимок состояния файла для статуса в реальном времени (функция ТЗ №8)."""
@@ -79,6 +90,7 @@ class RefreshScheduler:
         on_run_complete: Callable[[RunRecord], None] | None = None,
         timeout_sec: int = 300,
         misfire_grace_sec: int = 3600,
+        timezone=None,
     ) -> None:
         self._storage = storage
         self._refresh_func = refresh_func or excel_refresher.refresh_workbook
@@ -86,7 +98,7 @@ class RefreshScheduler:
         self._timeout_sec = timeout_sec
         self._misfire_grace = misfire_grace_sec
 
-        self._scheduler = BackgroundScheduler()
+        self._scheduler = BackgroundScheduler(timezone=timezone or _local_timezone())
 
         # Защита от одновременного обновления одного файла.
         self._locks: dict[int, threading.Lock] = {}
