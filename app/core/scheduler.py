@@ -42,14 +42,18 @@ logger = logging.getLogger(__name__)
 
 
 def _local_timezone():
-    """Фактическая локальная зона ОС с текущим смещением.
+    """Возвращает zoneinfo-зону ОС, совместимую с APScheduler.
 
-    Берём смещение из самой ОС, а не из авто-определения tzlocal: при
-    расхождении настроек системы tzlocal может вернуть зону с другим
-    смещением (предупреждение «offset does not match»), из-за чего
-    расписания «в ЧЧ:ММ» сработали бы со сдвигом на час.
+    Используем ZoneInfo с именем из tzlocal, а при недоступности —
+    фиксированное смещение. Это гарантирует, что next_run_time
+    хранится в реальной именованной зоне, а не в fixed-offset UTC+N,
+    из-за которой APScheduler мог показывать время со сдвигом.
     """
-    return datetime.now().astimezone().tzinfo
+    try:
+        from tzlocal import get_localzone
+        return get_localzone()
+    except Exception:
+        return datetime.now().astimezone().tzinfo
 
 
 @dataclass(slots=True)
