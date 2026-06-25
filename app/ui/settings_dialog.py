@@ -50,7 +50,6 @@ class SettingsDialog(QDialog):
         if not autostart.is_supported():
             self.cb_autostart.setEnabled(False)
             root.addWidget(self._hint("Автозапуск доступен только на Windows."))
-        root.addWidget(self._hint("Аналитика подключится на Этапе 6."))
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
