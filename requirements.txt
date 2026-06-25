@@ -6,7 +6,6 @@
 
 # --- GUI ---
 PyQt6>=6.7.0
-PyQt6-WebEngine>=6.7.0          # embedded browser for the ad banner (Stage 5)
 
 # --- Excel via COM (Windows only) ---
 pywin32>=306
