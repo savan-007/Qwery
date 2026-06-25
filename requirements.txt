@@ -20,6 +20,8 @@ Pillow>=10.0.0
 # --- Build to .exe (needed only for release, Stage 7) ---
 pyinstaller>=6.0.0
 
+tzlocal>=4.0
+
 # Storage (SQLite, json) are standard library modules - no install needed.
 # Analytics server (FastAPI, Stage 6) is a SEPARATE component and will get
 # its own server/requirements.txt later.
