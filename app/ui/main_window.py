@@ -63,7 +63,7 @@ _OK_COLOR = QColor("#1a7f37")
 _ERR_COLOR = QColor("#cf222e")
 _FILE_FILTER = "Книги Excel (*.xlsx *.xlsm *.xlsb);;Все файлы (*)"
 
-_C_NAME, _C_SCHED, _C_STATE, _C_LAST, _C_NEXT = range(5)
+_C_CHECK, _C_NAME, _C_SCHED, _C_STATE, _C_LAST, _C_NEXT = range(6)
 _J_TIME, _J_FILE, _J_DUR, _J_RESULT = range(4)
 _ID_ROLE = Qt.ItemDataRole.UserRole
 
@@ -76,11 +76,19 @@ class SignalBridge(QObject):
 
 
 def _fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%d.%m %H:%M:%S")
+    local_dt = dt.astimezone()
+    return local_dt.strftime("%d.%m %H:%M:%S")
 
 
 def _fmt_next(dt: datetime) -> str:
-    return dt.strftime("%d.%m %H:%M")
+    """Форматировать время следующего запуска в локальном времени.
+
+    next_run_time от APScheduler приходит как aware datetime
+    (с зоной планировщика). Конвертируем в локальное время ОС,
+    чтобы не было сдвига при отображении.
+    """
+    local_dt = dt.astimezone()  # → системная зона
+    return local_dt.strftime("%d.%m %H:%M")
 
 
 def _fmt_dur(sec: float) -> str:
@@ -212,10 +220,9 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        self.files_table = self._make_table(
-            ["Файл", "Расписание", "Состояние", "Последнее обновление", "Следующее"]
-        )
+        self.files_table = self._make_files_table()
         self.files_table.itemSelectionChanged.connect(self._update_buttons)
+        self.files_table.itemChanged.connect(self._on_table_item_changed)
         self.files_table.doubleClicked.connect(self.on_edit_schedule)
         splitter.addWidget(self._titled("Файлы", self.files_table))
 
@@ -239,6 +246,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStyleSheet(_STYLE)
         self._update_buttons()
+
+    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        """Обновить состояние кнопок при изменении чекбокса."""
+        if item.column() == _C_CHECK:
+            self._update_buttons()
 
     def _build_tray(self) -> None:
         self._tray = QSystemTrayIcon(self._app_icon, self)
@@ -273,6 +285,62 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         return table
 
+    def _make_files_table(self) -> QTableWidget:
+        """Таблица файлов: с чекбоксами и MultiSelection."""
+        headers = ["", "Файл", "Расписание", "Состояние",
+                   "Последнее обновление", "Следующее"]
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        header = table.horizontalHeader()
+        # колонка чекбокса — фиксированная маленькая
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(0, 28)
+        # колонка имени файла — растягивается
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i in range(2, len(headers)):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        return table
+
+    def rebuild_files_table(self) -> None:
+        # Запомним какие id были отмечены, чтобы сохранить состояние чекбоксов
+        # при перестройке таблицы (например, после toggle enabled).
+        previously_checked = self._checked_file_ids()
+
+        statuses = self._scheduler.get_status()
+        self.files_table.setRowCount(len(statuses))
+        self._row_by_id.clear()
+        for row, st in enumerate(statuses):
+            fid = st.file.id
+            self._row_by_id[fid] = row
+
+            # --- Колонка 0: чекбокс ---
+            check_item = QTableWidgetItem()
+            check_item.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+            )
+            state = (Qt.CheckState.Checked
+                     if fid in previously_checked
+                     else Qt.CheckState.Unchecked)
+            check_item.setCheckState(state)
+            check_item.setData(_ID_ROLE, fid)
+            self.files_table.setItem(row, _C_CHECK, check_item)
+
+            # --- Колонка 1: имя файла ---
+            name_item = QTableWidgetItem(st.file.path.name)
+            name_item.setData(_ID_ROLE, fid)
+            name_item.setToolTip(str(st.file.path))
+            self.files_table.setItem(row, _C_NAME, name_item)
+
+            self.files_table.setItem(row, _C_SCHED,
+                                     QTableWidgetItem(st.file.schedule.describe()))
+            self._fill_dynamic(row, st)
+        self._update_buttons()
+
     @staticmethod
     def _titled(title: str, inner: QWidget) -> QWidget:
         box = QWidget()
@@ -297,21 +365,6 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- #
     # Таблица файлов
     # ----------------------------------------------------------------- #
-    def rebuild_files_table(self) -> None:
-        statuses = self._scheduler.get_status()
-        self.files_table.setRowCount(len(statuses))
-        self._row_by_id.clear()
-        for row, st in enumerate(statuses):
-            fid = st.file.id
-            self._row_by_id[fid] = row
-            name_item = QTableWidgetItem(st.file.path.name)
-            name_item.setData(_ID_ROLE, fid)
-            name_item.setToolTip(str(st.file.path))
-            self.files_table.setItem(row, _C_NAME, name_item)
-            self.files_table.setItem(row, _C_SCHED, QTableWidgetItem(st.file.schedule.describe()))
-            self._fill_dynamic(row, st)
-        self._update_buttons()
-
     def _fill_dynamic(self, row: int, st) -> None:
         if st.running:
             state_text = "обновляется…"
@@ -351,16 +404,32 @@ class MainWindow(QMainWindow):
                 self._fill_dynamic(row, st)
 
     def _selected_file_id(self) -> int | None:
+        """Id файла в текущей выделенной строке (для одиночных операций)."""
         row = self.files_table.currentRow()
         if row < 0:
             return None
-        item = self.files_table.item(row, _C_NAME)
+        item = self.files_table.item(row, _C_NAME)  # ← было _C_NAME=0, теперь =1
         return item.data(_ID_ROLE) if item else None
 
+    def _checked_file_ids(self) -> list[int]:
+        """Список id файлов, у которых отмечен чекбокс в колонке _C_CHECK."""
+        result = []
+        for row in range(self.files_table.rowCount()):
+            item = self.files_table.item(row, _C_CHECK)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                fid = item.data(_ID_ROLE)
+                if fid is not None:
+                    result.append(fid)
+        return result
+
     def _update_buttons(self) -> None:
-        has = self._selected_file_id() is not None
-        for b in (self.btn_edit, self.btn_toggle, self.btn_run, self.btn_remove):
-            b.setEnabled(has)
+        has_selected = self._selected_file_id() is not None
+        has_checked = len(self._checked_file_ids()) > 0
+        # «Расписание» — работает и от чекбоксов, и от выделения строки
+        self.btn_edit.setEnabled(has_selected or has_checked)
+        # Остальные — только от выделенной строки
+        for b in (self.btn_toggle, self.btn_run, self.btn_remove):
+            b.setEnabled(has_selected)
 
     # ----------------------------------------------------------------- #
     # Журнал
@@ -447,22 +516,38 @@ class MainWindow(QMainWindow):
             )
 
     def on_edit_schedule(self) -> None:
-        fid = self._selected_file_id()
-        if fid is None:
+        """Изменить расписание для отмеченных файлов (или текущего выделенного)."""
+        # Приоритет: отмеченные чекбоксами; если нет — текущая выделенная строка
+        fids = self._checked_file_ids()
+        if not fids:
+            fid = self._selected_file_id()
+            if fid is None:
+                return
+            fids = [fid]
+
+        # Для предзаполнения берём расписание первого файла в списке
+        first_wf = self._storage.get_file(fids[0])
+        if first_wf is None:
             return
-        wf = self._storage.get_file(fid)
-        if wf is None:
-            return
-        dialog = ScheduleDialog(self, schedule=wf.schedule)
+        dialog = ScheduleDialog(self, schedule=first_wf.schedule)
         if dialog.exec() != int(ScheduleDialog.DialogCode.Accepted):
             return
         schedule = dialog.get_schedule()
         if schedule is None:
             return
-        self._storage.update_schedule(fid, schedule)
-        self._scheduler.sync_file(fid)
+
+        # Применяем ко всем отмеченным
+        for fid in fids:
+            self._storage.update_schedule(fid, schedule)
+            self._scheduler.sync_file(fid)
+
         self.rebuild_files_table()
         self.update_status_strip()
+
+        if len(fids) > 1:
+            self.statusBar().showMessage(
+                f"Расписание обновлено для {len(fids)} файлов", 3000
+            )
 
     def on_toggle_enabled(self) -> None:
         fid = self._selected_file_id()
