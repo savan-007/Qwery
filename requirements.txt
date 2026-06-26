@@ -13,15 +13,14 @@ pywin32>=306
 # --- Task scheduler ---
 APScheduler>=3.10.4
 
-# --- System tray ---
-pystray>=0.19.5
-Pillow>=10.0.0
+# --- Timezone data (zoneinfo on Windows has no system IANA database) ---
+tzlocal>=4.0
+tzdata>=2024.1
 
 # --- Build to .exe (needed only for release, Stage 7) ---
 pyinstaller>=6.0.0
 
-tzlocal>=4.0
-
-# Storage (SQLite, json) are standard library modules - no install needed.
-# Analytics server (FastAPI, Stage 6) is a SEPARATE component and will get
-# its own server/requirements.txt later.
+# Storage (SQLite, json) and system tray (QSystemTrayIcon) use only
+# the standard library / PyQt6 — no extra packages needed.
+# Analytics server (FastAPI, Stage 6) is a SEPARATE component with its
+# own server/requirements.txt.
