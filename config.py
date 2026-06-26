@@ -44,7 +44,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # --- Аналитика и проверка обновлений (Этап 6) ---
 # Базовый URL сервера аналитики (FastAPI на Render). Без завершающего слэша.
 # В разработке можно временно указать "http://127.0.0.1:8000".
-ANALYTICS_URL = "https://qwery-analytics-onrender-com.onrender.com"
+ANALYTICS_URL = "https://qwery-analytics.onrender.com"
 ANALYTICS_TIMEOUT_SEC = 5                            # таймаут сетевых запросов, сек
 INSTALL_ID_PATH = DATA_DIR / "install_id"            # анонимный UUID установки (один раз)
 
