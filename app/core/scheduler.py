@@ -28,11 +28,14 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable
 
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.core import excel_refresher
@@ -95,6 +98,9 @@ class RefreshScheduler:
         timeout_sec: int = 300,
         misfire_grace_sec: int = 3600,
         timezone=None,
+        max_concurrent: int = 2,
+        defer_minutes: int = 10,
+        max_deferrals: int = 3,
     ) -> None:
         self._storage = storage
         self._refresh_func = refresh_func or excel_refresher.refresh_workbook
@@ -102,7 +108,23 @@ class RefreshScheduler:
         self._timeout_sec = timeout_sec
         self._misfire_grace = misfire_grace_sec
 
-        self._scheduler = BackgroundScheduler(timezone=timezone or _local_timezone())
+        # Задача 1: жёсткий потолок одновременных обновлений — действует и на
+        # плановые задачи, и на ручные run_now (оба пути проходят через _execute).
+        self._max_concurrent = max(1, int(max_concurrent))
+        self._slots = threading.BoundedSemaphore(self._max_concurrent)
+
+        # Задача 2: параметры откладывания «файл занят сотрудником».
+        self._defer_minutes = int(defer_minutes)
+        self._max_deferrals = int(max_deferrals)
+        self._deferrals: dict[int, int] = {}
+        self._deferrals_guard = threading.Lock()
+
+        # Пул APScheduler ограничиваем тем же числом, что и слоты, — чтобы
+        # планировщик не запускал больше плановых задач, чем мы готовы выполнять.
+        self._scheduler = BackgroundScheduler(
+            timezone=timezone or _local_timezone(),
+            executors={"default": ThreadPoolExecutor(max_workers=self._max_concurrent)},
+        )
 
         # Защита от одновременного обновления одного файла.
         self._locks: dict[int, threading.Lock] = {}
@@ -177,6 +199,9 @@ class RefreshScheduler:
             logger.info("Задача снята id=%s", file_id)
         except Exception:
             pass  # задачи не было — это нормально
+        # Снимаем и отложенный повтор, и счётчик попыток откладывания.
+        self.remove_retry(file_id)
+        self._reset_deferrals(file_id)
 
     def run_now(self, file_id: int) -> threading.Thread:
         """Запустить обновление файла немедленно (в отдельном потоке)."""
@@ -203,13 +228,29 @@ class RefreshScheduler:
             if not wf.enabled:
                 return None
 
-            with self._running_guard:
-                self._running.add(file_id)
+            # --- Задача 2: файл открыт сотрудником → отложить ---
+            # Проверка дешёвая и идёт ДО захвата слота и запуска Excel,
+            # чтобы не занимать ресурс впустую.
+            if excel_refresher.is_file_locked(wf.path):
+                return self._handle_locked(wf)
+
+            # Файл свободен — сбрасываем счётчик откладываний.
+            self._reset_deferrals(file_id)
+
+            # --- Задача 1: не более N одновременных обновлений ---
+            # Блокирующий захват слота = очередь: лишние обновления ждут здесь,
+            # пока не освободится один из N слотов.
+            self._slots.acquire()
             try:
-                result = self._refresh_func(wf.path, timeout_sec=self._timeout_sec)
-            finally:
                 with self._running_guard:
-                    self._running.discard(file_id)
+                    self._running.add(file_id)
+                try:
+                    result = self._refresh_func(wf.path, timeout_sec=self._timeout_sec)
+                finally:
+                    with self._running_guard:
+                        self._running.discard(file_id)
+            finally:
+                self._slots.release()
 
             record = self._storage.log_run(result, file_id=file_id)
             logger.info(
@@ -217,15 +258,96 @@ class RefreshScheduler:
                 file_id,
                 "OK" if record.success else f"ОШИБКА: {record.error}",
             )
-
-            if self._on_run_complete is not None:
-                try:
-                    self._on_run_complete(record)
-                except Exception:
-                    logger.exception("Ошибка в колбэке on_run_complete")
+            self._publish(record)
             return record
         finally:
             lock.release()
+
+    # ----------------------------------------------------------------- #
+    # Откладывание занятого файла (Задача 2) и публикация результата
+    # ----------------------------------------------------------------- #
+    @staticmethod
+    def _retry_job_id(file_id: int) -> str:
+        return f"file:{file_id}:retry"
+
+    def _publish(self, record: RunRecord) -> None:
+        """Отдать запись в UI через колбэк (обычные и «искусственные» события)."""
+        if self._on_run_complete is not None:
+            try:
+                self._on_run_complete(record)
+            except Exception:
+                logger.exception("Ошибка в колбэке on_run_complete")
+
+    def _reset_deferrals(self, file_id: int) -> None:
+        with self._deferrals_guard:
+            self._deferrals.pop(file_id, None)
+
+    def remove_retry(self, file_id: int) -> None:
+        """Снять отложенную разовую задачу повтора, если она есть."""
+        try:
+            self._scheduler.remove_job(self._retry_job_id(file_id))
+        except Exception:
+            pass
+
+    def _log_synthetic(self, file_id: int, path, error: str) -> RunRecord:
+        """
+        Записать в журнал «искусственное» событие (отложено / исчерпано).
+
+        Лёгкий путь без изменения схемы БД: обычная запись run_log с
+        success=0 и понятным текстом; started_at == finished_at (0 c).
+        Результат уходит в UI тем же колбэком, что и обычные обновления.
+        """
+        now = datetime.now()
+        synthetic = excel_refresher.RefreshResult(Path(path), False, now, now, error)
+        record = self._storage.log_run(synthetic, file_id=file_id)
+        self._publish(record)
+        return record
+
+    def _schedule_retry(self, file_id: int, run_at: datetime) -> None:
+        """Поставить разовую задачу APScheduler на повтор (DateTrigger)."""
+        self._scheduler.add_job(
+            self._execute,
+            trigger=DateTrigger(run_date=run_at),
+            args=[file_id],
+            id=self._retry_job_id(file_id),
+            name=f"retry:{file_id}",
+            replace_existing=True,  # один отложенный повтор на файл, не плодим
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=self._misfire_grace,
+        )
+
+    def _handle_locked(self, wf: WatchedFile) -> RunRecord | None:
+        """
+        Файл занят сотрудником: отложить на defer_minutes, максимум
+        max_deferrals раз; после исчерпания — записать ошибку.
+        """
+        file_id = wf.id
+        with self._deferrals_guard:
+            attempts = self._deferrals.get(file_id, 0) + 1
+            self._deferrals[file_id] = attempts
+
+        if attempts > self._max_deferrals:
+            # Попытки исчерпаны — фиксируем ошибку, чистим счётчик и повтор.
+            self._reset_deferrals(file_id)
+            self.remove_retry(file_id)
+            logger.warning("Файл id=%s занят, попытки исчерпаны (%s)",
+                           file_id, self._max_deferrals)
+            return self._log_synthetic(
+                file_id, wf.path,
+                f"файл занят сотрудником — попытки исчерпаны "
+                f"({self._max_deferrals})",
+            )
+
+        run_at = datetime.now() + timedelta(minutes=self._defer_minutes)
+        self._schedule_retry(file_id, run_at)
+        logger.info("Файл id=%s занят — отложен до %s (попытка %s из %s)",
+                    file_id, run_at.strftime("%H:%M"), attempts, self._max_deferrals)
+        return self._log_synthetic(
+            file_id, wf.path,
+            f"файл занят — отложено до {run_at.strftime('%H:%M')} "
+            f"(попытка {attempts} из {self._max_deferrals})",
+        )
 
     # ----------------------------------------------------------------- #
     # Статус (функция №8)
