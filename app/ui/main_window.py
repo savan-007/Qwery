@@ -63,6 +63,7 @@ from app.core.single_instance import SingleInstance
 logger = logging.getLogger(__name__)
 
 _OK_COLOR = QColor("#1a7f37")
+_DEFER_COLOR = QColor("#9a6700")
 _ERR_COLOR = QColor("#cf222e")
 _FILE_FILTER = "Книги Excel (*.xlsx *.xlsm *.xlsb);;Все файлы (*)"
 
@@ -447,9 +448,18 @@ class MainWindow(QMainWindow):
         self.journal_table.setItem(row, _J_TIME, QTableWidgetItem(_fmt_dt(rec.started_at)))
         self.journal_table.setItem(row, _J_FILE, QTableWidgetItem(rec.file_path.name))
         self.journal_table.setItem(row, _J_DUR, QTableWidgetItem(_fmt_dur(rec.duration_sec)))
-        result = "✓ Успех" if rec.success else f"✗ {rec.error or 'ошибка'}"
+
+        # «Отложено» (файл занят) показываем нейтрально, а не как ошибку.
+        is_deferred = bool(rec.error) and rec.error.startswith("файл занят — отложено")
+        if rec.success:
+            result, color = "✓ Успех", _OK_COLOR
+        elif is_deferred:
+            result, color = f"⏸ {rec.error}", _DEFER_COLOR
+        else:
+            result, color = f"✗ {rec.error or 'ошибка'}", _ERR_COLOR
+
         item = QTableWidgetItem(result)
-        item.setForeground(QBrush(_OK_COLOR if rec.success else _ERR_COLOR))
+        item.setForeground(QBrush(color))
         if rec.error:
             item.setToolTip(rec.error)
         self.journal_table.setItem(row, _J_RESULT, item)
