@@ -23,8 +23,10 @@ app/ui/main_window.py
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPixmap
@@ -56,6 +58,7 @@ from app.core.settings import Settings
 from app.core.storage import RunRecord, Storage
 from app.ui.schedule_dialog import ScheduleDialog
 from app.ui.settings_dialog import SettingsDialog
+from app.core.single_instance import SingleInstance
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +496,11 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы Excel", "", _FILE_FILTER)
         if not paths:
             return
+
+        # Предложить сделать резервную копию (один вопрос на все файлы).
+        # Копия — разовый бэкап рядом; в список и планировщик идёт ОРИГИНАЛ.
+        self._maybe_backup_files(paths)
+
         dialog = ScheduleDialog(self)
         if dialog.exec() != int(ScheduleDialog.DialogCode.Accepted):
             return
@@ -513,6 +521,61 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "Добавление файлов",
                 f"Добавлено: {added}. Уже в списке (пропущено): {skipped}.",
+            )
+
+    def _maybe_backup_files(self, paths: list[str]) -> None:
+        """Предложить сделать резервную копию выбранных файлов.
+
+        Вопрос задаётся ОДИН раз на все файлы. Если пользователь соглашается,
+        для каждого файла спрашивается путь сохранения копии через
+        QFileDialog.getSaveFileName.
+
+        Важно: копия — разовый бэкап. В список отслеживания и в планировщик
+        попадает ОРИГИНАЛ, а не копия. Ошибка/отмена копирования не мешает
+        добавлению файла.
+        """
+        reply = QMessageBox.question(
+            self,
+            "Резервная копия",
+            "Сделать копию файла перед добавлением?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        copied, failed = 0, 0
+        for path in paths:
+            src = Path(path)
+            # Имя по умолчанию: «<имя>_копия<суффикс>» в папке оригинала.
+            default_path = str(src.with_name(f"{src.stem}_копия{src.suffix}"))
+            dest, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Сохранить копию: {src.name}",
+                default_path,
+                _FILE_FILTER,
+            )
+            if not dest:
+                # Пользователь отменил сохранение копии для этого файла — пропуск.
+                continue
+            try:
+                # Защита от копирования файла в самого себя.
+                if Path(dest).resolve() == src.resolve():
+                    logger.info("Копия совпадает с оригиналом — пропуск: %s", src)
+                    continue
+                shutil.copy2(src, dest)
+                copied += 1
+                logger.info("Создана копия: %s → %s", src, dest)
+            except OSError as exc:
+                failed += 1
+                logger.error("Не удалось скопировать %s → %s: %s", src, dest, exc)
+
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Резервная копия",
+                f"Скопировано: {copied}. Не удалось скопировать: {failed}.\n"
+                "Подробности — в журнале приложения.",
             )
 
     def on_edit_schedule(self) -> None:
@@ -752,16 +815,28 @@ QHeaderView::section {
 """
 
 
-def run() -> int:
+def _setup_logging() -> None:
+    """Логи в файл всегда; в консоль — только в режиме разработки.
+
+    В собранном windowed-режиме (.exe без консоли) sys.stderr == None,
+    и StreamHandler становится бесполезным/шумным — подключаем его только
+    когда запущены из интерпретатора.
+    """
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(config.LOG_PATH, encoding="utf-8"),
+    ]
+    if not getattr(sys, "frozen", False) and sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(config.LOG_PATH, encoding="utf-8"),
-        ],
+        handlers=handlers,
     )
-    # WebEngine рекомендует общий контекст OpenGL — выставить до QApplication.
+
+
+def run() -> int:
+    _setup_logging()
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(config.APP_NAME)
     app.setOrganizationName(config.ORG_NAME)
@@ -769,9 +844,22 @@ def run() -> int:
     # (окно может быть скрыто в трее).
     app.setQuitOnLastWindowClosed(False)
 
+    # Защита от второго экземпляра: автозапуск с Windows + ручной запуск
+    # ярлыка иначе дадут два процесса, и оба будут обновлять одни файлы.
+    guard = SingleInstance()
+    if guard.already_running():
+        logger.warning("Экземпляр уже запущен — выходим")
+        QMessageBox.information(
+            None, config.APP_NAME,
+            "Программа уже запущена (проверьте системный трей).",
+        )
+        return 0
+
     storage = Storage()
     window = MainWindow(storage)
     window.show()
+    # guard остаётся в области видимости до конца app.exec() — сегмент
+    # общей памяти живёт всё время работы приложения.
     return app.exec()
 
 
